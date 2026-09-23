@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
-import { Play, Pause, RotateCcw, Activity, ListChecks, Settings2, X, Footprints, Flower2, Wind, Moon } from 'lucide-react';
+import { Play, Pause, RotateCcw, Activity, ListChecks, Settings2, X, Footprints, Flower2, Wind, Moon, Bell } from 'lucide-react';
 
 // ============================================================
 // 🔊 AUDIO ENGINE
@@ -71,11 +71,10 @@ const vibrate = (pattern: number | number[]) => {
 };
 
 // ============================================================
-// 🔒 WAKE LOCK HOOK — Screen बंद होऊ देत नाही
+// 🔒 WAKE LOCK HOOK
 // ============================================================
 function useWakeLock(isActive: boolean) {
   const wakeLockRef = useRef<any>(null);
-
   useEffect(() => {
     const acquire = async () => {
       try {
@@ -84,26 +83,18 @@ function useWakeLock(isActive: boolean) {
         }
       } catch (e) {}
     };
-
     const release = () => {
       if (wakeLockRef.current) {
         wakeLockRef.current.release().catch(() => {});
         wakeLockRef.current = null;
       }
     };
-
-    if (isActive) {
-      acquire();
-    } else {
-      release();
-    }
-
-    // Re-acquire after tab becomes visible again
+    if (isActive) acquire();
+    else release();
     const handleVisibility = () => {
       if (document.visibilityState === 'visible' && isActive) acquire();
     };
     document.addEventListener('visibilitychange', handleVisibility);
-
     return () => {
       document.removeEventListener('visibilitychange', handleVisibility);
       if (!isActive) release();
@@ -112,7 +103,129 @@ function useWakeLock(isActive: boolean) {
 }
 
 // ============================================================
-// 🔵 SVG PROGRESS RING COMPONENT
+// 🔔 NOTIFICATION SERVICE WORKER HOOK
+// ============================================================
+function useTimerNotifications() {
+  const swRef = useRef<ServiceWorkerRegistration | null>(null);
+  const [notifEnabled, setNotifEnabled] = useState(false);
+  const [notifStatus, setNotifStatus] = useState<'idle' | 'granted' | 'denied' | 'unsupported'>('idle');
+
+  useEffect(() => {
+    if (!('Notification' in window)) {
+      setNotifStatus('unsupported');
+      return;
+    }
+    if (Notification.permission === 'granted') {
+      setNotifStatus('granted');
+      registerSW();
+    } else if (Notification.permission === 'denied') {
+      setNotifStatus('denied');
+    }
+  }, []);
+
+  const registerSW = async () => {
+    if (!('serviceWorker' in navigator)) return false;
+    try {
+      const reg = await navigator.serviceWorker.register('/timer-sw.js');
+      await navigator.serviceWorker.ready;
+      swRef.current = reg;
+      setNotifEnabled(true);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const requestPermission = async () => {
+    if (!('Notification' in window)) return false;
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission === 'granted') {
+        setNotifStatus('granted');
+        const ok = await registerSW();
+        if (ok) {
+          // Test notification
+          swRef.current?.active?.postMessage({
+            type: 'SHOW_NOW',
+            payload: {
+              title: '🔔 Rushi Tracker',
+              body: 'Phase change notifications enabled!'
+            }
+          });
+        }
+        return ok;
+      } else {
+        setNotifStatus('denied');
+        return false;
+      }
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const schedulePhaseNotifications = (
+    currentTimeMs: number,
+    walkDurationMs: number,
+    runDurationMs: number,
+    walkTimeConfig: { m: number; s: number },
+    runTimeConfig: { m: number; s: number }
+  ) => {
+    const sw = swRef.current;
+    if (!sw || !notifEnabled) return;
+
+    const cycleDuration = walkDurationMs + runDurationMs;
+    const events: { triggerAt: number; title: string; body: string }[] = [];
+
+    let simTime = currentTimeMs;
+    const now = Date.now();
+
+    // Generate next 20 phase changes
+    for (let i = 0; i < 20; i++) {
+      const cycleTime = simTime % cycleDuration;
+      const isWalk = cycleTime < walkDurationMs;
+      const timeToNext = isWalk
+        ? walkDurationMs - cycleTime
+        : cycleDuration - cycleTime;
+
+      const triggerAt = now + timeToNext;
+      const nextIsWalk = !isWalk;
+
+      events.push({
+        triggerAt,
+        title: nextIsWalk ? '🚶 Walking Phase' : '🏃 Running Phase!',
+        body: nextIsWalk
+          ? `Walk for ${walkTimeConfig.m}m ${walkTimeConfig.s > 0 ? walkTimeConfig.s + 's' : ''}`
+          : `Run for ${runTimeConfig.m}m ${runTimeConfig.s > 0 ? runTimeConfig.s + 's' : ''}`,
+      });
+
+      simTime += timeToNext;
+    }
+
+    // Send to service worker
+    const sendMessage = (reg: ServiceWorkerRegistration) => {
+      const target = reg.active || reg.installing || reg.waiting;
+      target?.postMessage({ type: 'SCHEDULE_NOTIFICATIONS', payload: { events } });
+    };
+
+    if (sw.active) {
+      sendMessage(sw);
+    } else {
+      navigator.serviceWorker.ready.then(reg => sendMessage(reg));
+    }
+  };
+
+  const cancelNotifications = () => {
+    const sw = swRef.current;
+    if (!sw) return;
+    const target = sw.active || sw.installing || sw.waiting;
+    target?.postMessage({ type: 'CANCEL_NOTIFICATIONS' });
+  };
+
+  return { notifEnabled, notifStatus, requestPermission, schedulePhaseNotifications, cancelNotifications };
+}
+
+// ============================================================
+// 🔵 SVG PROGRESS RING
 // ============================================================
 function ProgressRing({
   progress, size, strokeWidth = 4, color = '#3B82F6', glowColor
@@ -121,33 +234,26 @@ function ProgressRing({
 }) {
   const radius = (size - strokeWidth * 2) / 2;
   const circumference = 2 * Math.PI * radius;
-  const clampedProgress = Math.min(100, Math.max(0, progress));
-  const offset = circumference * (1 - clampedProgress / 100);
-
+  const offset = circumference * (1 - Math.min(100, Math.max(0, progress)) / 100);
   return (
-    <svg
-      width={size} height={size}
-      className="absolute top-0 left-0 pointer-events-none"
-      style={{ transform: 'rotate(-90deg)' }}
-    >
+    <svg width={size} height={size} className="absolute top-0 left-0 pointer-events-none"
+      style={{ transform: 'rotate(-90deg)' }}>
       <circle cx={size / 2} cy={size / 2} r={radius}
         fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth={strokeWidth} />
       <circle cx={size / 2} cy={size / 2} r={radius}
         fill="none" stroke={color} strokeWidth={strokeWidth}
-        strokeDasharray={circumference}
-        strokeDashoffset={offset}
+        strokeDasharray={circumference} strokeDashoffset={offset}
         strokeLinecap="round"
         style={{
           transition: 'stroke-dashoffset 0.6s cubic-bezier(0.4,0,0.2,1)',
           filter: glowColor ? `drop-shadow(0 0 6px ${glowColor})` : undefined
-        }}
-      />
+        }} />
     </svg>
   );
 }
 
 // ============================================================
-// 🏃 CARDIO / RUN TRACKER
+// 🏃 CARDIO / RUN TRACKER — With Background Notifications
 // ============================================================
 function RunTracker() {
   const [time, setTime] = useState(0);
@@ -167,6 +273,7 @@ function RunTracker() {
   const prevPhaseRef = useRef('Walking');
 
   useWakeLock(isRunning);
+  const { notifEnabled, notifStatus, requestPermission, schedulePhaseNotifications, cancelNotifications } = useTimerNotifications();
 
   const walkDuration = (walkTime.m * 60 + walkTime.s) * 1000;
   const runDuration = (runTime.m * 60 + runTime.s) * 1000;
@@ -180,7 +287,7 @@ function RunTracker() {
   const phaseProgress = ((phaseTotal - phaseTimeRemaining) / phaseTotal) * 100;
   const currentRoundDisplay = Math.floor(time / cycleDuration) + 1;
 
-  // ✅ Background-safe timer using timestamps
+  // ✅ Background-safe timer
   useEffect(() => {
     let intervalId: ReturnType<typeof setInterval>;
     if (isRunning) {
@@ -192,17 +299,17 @@ function RunTracker() {
     return () => clearInterval(intervalId);
   }, [isRunning]);
 
-  // ✅ Page Visibility — recalculate on resume
+  // ✅ Page Visibility — reschedule notifications on resume
   useEffect(() => {
     const handle = () => {
       if (!document.hidden && isRunning) {
-        // Next interval will auto-correct based on Date.now()
-        setTime(accumulatedTimeRef.current + (Date.now() - startTimeRef.current));
+        const currentTime = accumulatedTimeRef.current + (Date.now() - startTimeRef.current);
+        schedulePhaseNotifications(currentTime, walkDuration, runDuration, walkTime, runTime);
       }
     };
     document.addEventListener('visibilitychange', handle);
     return () => document.removeEventListener('visibilitychange', handle);
-  }, [isRunning]);
+  }, [isRunning, walkDuration, runDuration, walkTime, runTime]);
 
   // Phase change detection
   useEffect(() => {
@@ -246,9 +353,16 @@ function RunTracker() {
   };
 
   const handleStartPause = () => {
-    if (!isRunning) playTone();
-    vibrate(isRunning ? [30] : [50, 30, 80]);
-    if (isRunning) accumulatedTimeRef.current = time;
+    if (!isRunning) {
+      playTone();
+      vibrate([50, 30, 80]);
+      // Schedule background notifications
+      schedulePhaseNotifications(time, walkDuration, runDuration, walkTime, runTime);
+    } else {
+      accumulatedTimeRef.current = time;
+      vibrate([30]);
+      cancelNotifications();
+    }
     setShowSettings(false);
     setIsRunning(!isRunning);
   };
@@ -262,6 +376,7 @@ function RunTracker() {
     setHistory([]);
     prevPhaseRef.current = 'Walking';
     vibrate([30]);
+    cancelNotifications();
   };
 
   const handleTimeChange = (type: 'walk' | 'run', field: 'm' | 's', value: string) => {
@@ -280,6 +395,27 @@ function RunTracker() {
           ROUND {currentRoundDisplay}
         </span>
       </div>
+
+      {/* 🔔 Notification Permission Banner */}
+      {notifStatus !== 'granted' && notifStatus !== 'unsupported' && (
+        <button onClick={requestPermission}
+          className="w-full mb-4 bg-orange-500/15 border border-orange-500/30 rounded-2xl p-3 flex items-center gap-3 active:scale-95 transition-all">
+          <Bell size={16} className="text-orange-400 shrink-0" />
+          <div className="text-left">
+            <p className="text-orange-300 text-xs font-bold">Enable Background Notifications</p>
+            <p className="text-orange-300/50 text-[10px]">Phase change alerts when app is minimized</p>
+          </div>
+          <span className="ml-auto text-orange-400 text-[10px] font-bold">TAP</span>
+        </button>
+      )}
+
+      {/* Notification Enabled Badge */}
+      {notifEnabled && (
+        <div className="w-full mb-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl p-2.5 flex items-center gap-2">
+          <Bell size={14} className="text-emerald-400" />
+          <p className="text-emerald-400 text-[10px] font-bold">Background notifications active ✓</p>
+        </div>
+      )}
 
       {/* Speed Card */}
       <div className="bg-white/4 backdrop-blur-xl w-full rounded-2xl p-4 mb-4 border border-white/8 flex justify-between items-center shadow-lg">
@@ -317,7 +453,7 @@ function RunTracker() {
                   <div key={field} className="flex items-center gap-1">
                     <input type="number" value={t[field]}
                       onChange={e => handleTimeChange(type, field, e.target.value)}
-                      className="w-12 bg-black/30 border border-white/10 text-white p-2 rounded-lg text-center font-mono text-sm outline-none focus:border-blue-500/50 transition-colors"
+                      className="w-12 bg-black/30 border border-white/10 text-white p-2 rounded-lg text-center font-mono text-sm outline-none"
                       min="0" max={field === 's' ? '59' : undefined} />
                     <span className="text-white/25 text-[10px]">{field}</span>
                   </div>
@@ -328,11 +464,11 @@ function RunTracker() {
         </div>
       )}
 
-      {/* Phase Card with progress bar */}
+      {/* Phase Card */}
       <div className={`w-full rounded-2xl p-5 mb-6 border backdrop-blur-xl transition-all duration-700 ${
         isWalkPhase
-          ? 'bg-blue-950/25 border-blue-500/20 shadow-[0_0_30px_rgba(59,130,246,0.08)]'
-          : 'bg-orange-950/25 border-orange-500/20 shadow-[0_0_30px_rgba(249,115,22,0.08)]'
+          ? 'bg-blue-950/25 border-blue-500/20'
+          : 'bg-orange-950/25 border-orange-500/20'
       }`}>
         <div className="flex justify-between items-start mb-4">
           <div>
@@ -348,14 +484,13 @@ function RunTracker() {
         <div className="w-full h-0.5 bg-white/5 rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-300 ${isWalkPhase ? 'bg-blue-500' : 'bg-orange-500'}`}
-            style={{ width: `${phaseProgress}%` }}
-          />
+            style={{ width: `${phaseProgress}%` }} />
         </div>
       </div>
 
       {/* Main Timer */}
       <div className="text-center mb-8">
-        <p className="text-[3.2rem] font-mono font-extralight tracking-tighter text-white drop-shadow-2xl">
+        <p className="text-[3.2rem] font-mono font-extralight tracking-tighter text-white">
           {formatTime(time)}
         </p>
         <p className="text-white/25 text-[9px] mt-1 font-bold tracking-[0.3em] uppercase">Total Elapsed</p>
@@ -411,25 +546,19 @@ function RunTracker() {
 }
 
 // ============================================================
-// 🧘 YOGA — FULLY TIMESTAMP-BASED (Background-Safe Fix)
+// 🧘 YOGA — Fully Timestamp-Based
 // ============================================================
-
-// ✅ Compute yoga state from elapsed time — no interval dependency issues
 function computeYogaState(elapsedMs: number, phases: number[], targetCycles: number) {
   const active = phases.map((d, i) => ({ d, i })).filter(p => p.d > 0);
   if (active.length === 0) return { phaseIndex: 0, timeLeft: 0, cycleCount: 0, progress: 0, completed: false };
-
   const cycleDuration = active.reduce((s, p) => s + p.d, 0);
   const elapsedSec = elapsedMs / 1000;
   const cycleCount = Math.floor(elapsedSec / cycleDuration);
-
   if (targetCycles > 0 && cycleCount >= targetCycles) {
     return { phaseIndex: 0, timeLeft: 0, cycleCount, progress: 100, completed: true };
   }
-
   const timeInCycle = elapsedSec % cycleDuration;
   let accumulated = 0;
-
   for (const phase of active) {
     if (timeInCycle < accumulated + phase.d) {
       const timeLeft = Math.ceil(phase.d - (timeInCycle - accumulated));
@@ -438,7 +567,6 @@ function computeYogaState(elapsedMs: number, phases: number[], targetCycles: num
     }
     accumulated += phase.d;
   }
-
   return { phaseIndex: active[active.length - 1].i, timeLeft: 0, cycleCount, progress: 100, completed: false };
 }
 
@@ -464,7 +592,6 @@ function YogaTracker() {
 
   useWakeLock(isRunning);
 
-  // ✅ Compute state from elapsed time (timestamp-based = background-safe)
   const yogaState = useMemo(
     () => computeYogaState(elapsedMs, phases, targetCycles),
     [elapsedMs, phases, targetCycles]
@@ -474,7 +601,6 @@ function YogaTracker() {
   const currentActiveIdx = active.findIndex(p => p.i === yogaState.phaseIndex);
   const nextPhaseIndex = active.length > 0 ? active[(currentActiveIdx + 1) % active.length].i : 0;
 
-  // ✅ Single clean interval — no timeLeft dependency
   useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
     if (isRunning) {
@@ -486,52 +612,33 @@ function YogaTracker() {
     return () => clearInterval(interval);
   }, [isRunning]);
 
-  // Phase change → audio + haptic
   useEffect(() => {
     if (!isRunning || elapsedMs === 0) return;
     if (yogaState.phaseIndex !== prevPhaseRef.current) {
-      if (prevPhaseRef.current !== -1) {
-        playTone();
-        vibrate([50, 30, 50]);
-      }
+      if (prevPhaseRef.current !== -1) { playTone(); vibrate([50, 30, 50]); }
       prevPhaseRef.current = yogaState.phaseIndex;
     }
-    if (yogaState.cycleCount > prevCycleRef.current) {
-      prevCycleRef.current = yogaState.cycleCount;
-    }
+    if (yogaState.cycleCount > prevCycleRef.current) prevCycleRef.current = yogaState.cycleCount;
     if (yogaState.completed) {
-      playEndTone();
-      vibrate([100, 50, 100, 50, 200]);
-      accumulatedRef.current = elapsedMs;
-      setIsRunning(false);
+      playEndTone(); vibrate([100, 50, 100, 50, 200]);
+      accumulatedRef.current = elapsedMs; setIsRunning(false);
     }
   }, [yogaState, isRunning, elapsedMs]);
 
   const handleStartPause = () => {
     if (!isRunning) {
       if (yogaState.completed) {
-        accumulatedRef.current = 0;
-        setElapsedMs(0);
-        prevPhaseRef.current = -1;
-        prevCycleRef.current = 0;
+        accumulatedRef.current = 0; setElapsedMs(0);
+        prevPhaseRef.current = -1; prevCycleRef.current = 0;
       }
-      playTone();
-      vibrate([50, 30, 80]);
-    } else {
-      accumulatedRef.current = elapsedMs;
-      vibrate([30]);
-    }
-    setShowSettings(false);
-    setIsRunning(!isRunning);
+      playTone(); vibrate([50, 30, 80]);
+    } else { accumulatedRef.current = elapsedMs; vibrate([30]); }
+    setShowSettings(false); setIsRunning(!isRunning);
   };
 
   const handleReset = () => {
-    setIsRunning(false);
-    setElapsedMs(0);
-    accumulatedRef.current = 0;
-    prevPhaseRef.current = -1;
-    prevCycleRef.current = 0;
-    vibrate([30]);
+    setIsRunning(false); setElapsedMs(0); accumulatedRef.current = 0;
+    prevPhaseRef.current = -1; prevCycleRef.current = 0; vibrate([30]);
   };
 
   const activeStyle = phaseColors[yogaState.phaseIndex] ?? phaseColors[0];
@@ -539,7 +646,6 @@ function YogaTracker() {
 
   return (
     <div className="flex flex-col items-center w-full max-w-md pb-32 px-4 animate-in fade-in duration-500">
-      {/* Header */}
       <div className="flex justify-between items-center mb-6 w-full mt-4">
         <div className="flex items-center gap-2">
           <Wind className="text-white/40" size={16} />
@@ -559,7 +665,6 @@ function YogaTracker() {
         )}
       </div>
 
-      {/* Settings */}
       {showSettings && !isRunning && (
         <div className="bg-white/6 backdrop-blur-2xl w-full rounded-2xl p-5 mb-6 border border-white/12 animate-in slide-in-from-top-2 duration-200">
           <div className="flex justify-between items-center mb-5 pb-4 border-b border-white/8">
@@ -587,39 +692,27 @@ function YogaTracker() {
         </div>
       )}
 
-      {/* Progress Ring */}
       <div className="relative flex items-center justify-center mb-8 mt-2">
         <div className={`absolute rounded-full blur-3xl opacity-15 transition-all duration-1000 ${activeStyle.bg}`}
           style={{ width: ringSize, height: ringSize }} />
         <div className="relative" style={{ width: ringSize, height: ringSize }}>
-          <ProgressRing
-            progress={yogaState.progress}
-            size={ringSize}
-            strokeWidth={4}
-            color={activeStyle.hex}
-            glowColor={activeStyle.hex}
-          />
+          <ProgressRing progress={yogaState.progress} size={ringSize} strokeWidth={4}
+            color={activeStyle.hex} glowColor={activeStyle.hex} />
           <div className={`w-full h-full rounded-full border-2 flex flex-col items-center justify-center backdrop-blur-md bg-black/40 transition-all duration-700 ${activeStyle.border}`}
             style={{ boxShadow: `0 0 50px ${activeStyle.hex}15` }}>
             <p className={`text-[9px] font-bold tracking-[0.2em] uppercase mb-4 text-center px-6 ${activeStyle.text}`}>
               {phaseNames[yogaState.phaseIndex]}
             </p>
-            <p className="text-7xl font-mono font-extralight text-white">
-              {yogaState.timeLeft}
-            </p>
+            <p className="text-7xl font-mono font-extralight text-white">{yogaState.timeLeft}</p>
           </div>
         </div>
       </div>
 
-      {/* Next Phase */}
-      <div className="bg-white/4 backdrop-blur-xl border border-white/8 px-5 py-2.5 rounded-full mb-8 shadow-lg">
+      <div className="bg-white/4 backdrop-blur-xl border border-white/8 px-5 py-2.5 rounded-full mb-8">
         <span className="text-white/25 text-[9px] tracking-widest uppercase font-bold mr-2">Next:</span>
-        <span className={`text-sm font-medium ${phaseColors[nextPhaseIndex].text}`}>
-          {phaseNames[nextPhaseIndex]}
-        </span>
+        <span className={`text-sm font-medium ${phaseColors[nextPhaseIndex].text}`}>{phaseNames[nextPhaseIndex]}</span>
       </div>
 
-      {/* Controls */}
       <div className="flex gap-4 w-full">
         <button onClick={handleReset}
           className="flex-1 py-4 rounded-2xl bg-white/4 border border-white/8 hover:bg-white/8 transition-all flex justify-center items-center active:scale-95">
@@ -629,9 +722,7 @@ function YogaTracker() {
           className={`flex-[2.5] py-4 rounded-2xl transition-all flex justify-center items-center border border-white/12 shadow-lg active:scale-95 ${
             isRunning ? 'bg-red-500/70 hover:bg-red-500/90' : 'bg-emerald-500/70 hover:bg-emerald-500/90'
           }`}>
-          {isRunning
-            ? <Pause size={28} className="text-white fill-current" />
-            : <Play size={28} className="text-white fill-current ml-1" />}
+          {isRunning ? <Pause size={28} className="text-white fill-current" /> : <Play size={28} className="text-white fill-current ml-1" />}
         </button>
       </div>
     </div>
@@ -657,7 +748,6 @@ function MeditationTracker() {
   const progress = totalMs > 0 ? Math.min(100, (elapsedMs / totalMs) * 100) : 0;
   const completed = remainingMs === 0 && elapsedMs > 0 && totalMs > 0;
 
-  // ✅ Background-safe timer
   useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
     if (isRunning) {
@@ -665,46 +755,29 @@ function MeditationTracker() {
       interval = setInterval(() => {
         const newElapsed = accumulatedRef.current + (Date.now() - startTimeRef.current);
         if (newElapsed >= totalMs) {
-          setElapsedMs(totalMs);
-          setIsRunning(false);
-          playMeditationBell();
-          vibrate([200, 100, 200, 100, 500]);
-        } else {
-          setElapsedMs(newElapsed);
-        }
+          setElapsedMs(totalMs); setIsRunning(false);
+          playMeditationBell(); vibrate([200, 100, 200, 100, 500]);
+        } else { setElapsedMs(newElapsed); }
       }, 500);
     }
     return () => clearInterval(interval);
   }, [isRunning, totalMs]);
 
   const handleStartPause = () => {
-    if (completed) {
-      setElapsedMs(0);
-      accumulatedRef.current = 0;
-    }
+    if (completed) { setElapsedMs(0); accumulatedRef.current = 0; }
     if (!isRunning) vibrate([50, 30, 80]);
-    else {
-      accumulatedRef.current = elapsedMs;
-      vibrate([30]);
-    }
-    setShowSettings(false);
-    setIsRunning(!isRunning);
+    else { accumulatedRef.current = elapsedMs; vibrate([30]); }
+    setShowSettings(false); setIsRunning(!isRunning);
   };
 
   const handleReset = () => {
-    setIsRunning(false);
-    setElapsedMs(0);
-    accumulatedRef.current = 0;
-    vibrate([30]);
+    setIsRunning(false); setElapsedMs(0); accumulatedRef.current = 0; vibrate([30]);
   };
 
   const handleTimeChange = (field: 'h' | 'm', value: string) => {
     let num = parseInt(value) || 0;
     if (field === 'm' && num > 59) num = 59;
-    if (!isRunning) {
-      setElapsedMs(0);
-      accumulatedRef.current = 0;
-    }
+    if (!isRunning) { setElapsedMs(0); accumulatedRef.current = 0; }
     setMeditationTime(prev => ({ ...prev, [field]: num }));
   };
 
@@ -712,8 +785,7 @@ function MeditationTracker() {
     const h = Math.floor(ms / 3600000);
     const m = Math.floor((ms % 3600000) / 60000);
     const s = Math.floor((ms % 60000) / 1000);
-    if (h > 0)
-      return `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+    if (h > 0) return `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
     return `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
   };
 
@@ -742,19 +814,16 @@ function MeditationTracker() {
         )}
       </div>
 
-      {/* Settings */}
       {showSettings && !isRunning && (
         <div className="bg-white/6 backdrop-blur-2xl w-full rounded-2xl p-5 mb-6 border border-white/12 animate-in slide-in-from-top-2 duration-200">
           <p className="text-[9px] text-white/35 uppercase tracking-widest font-bold mb-4">Duration</p>
           <div className="flex justify-center items-center gap-5">
             {(['h', 'm'] as const).map(field => (
               <div key={field} className="flex flex-col items-center gap-2">
-                <p className="text-[9px] text-white/30 uppercase tracking-widest">
-                  {field === 'h' ? 'Hours' : 'Minutes'}
-                </p>
+                <p className="text-[9px] text-white/30 uppercase tracking-widest">{field === 'h' ? 'Hours' : 'Minutes'}</p>
                 <input type="number" value={meditationTime[field]}
                   onChange={e => handleTimeChange(field, e.target.value)}
-                  className="w-20 bg-black/30 border border-white/10 text-white p-3 rounded-xl text-center font-mono text-xl outline-none focus:border-indigo-500/50 transition-colors"
+                  className="w-20 bg-black/30 border border-white/10 text-white p-3 rounded-xl text-center font-mono text-xl outline-none"
                   min="0" max={field === 'm' ? '59' : undefined} />
               </div>
             ))}
@@ -762,24 +831,16 @@ function MeditationTracker() {
         </div>
       )}
 
-      {/* Progress Ring */}
       <div className="relative flex items-center justify-center mb-8 mt-2">
-        <div className="absolute rounded-full blur-3xl opacity-10 bg-indigo-600 transition-all duration-1000"
+        <div className="absolute rounded-full blur-3xl opacity-10 bg-indigo-600"
           style={{ width: ringSize, height: ringSize }} />
         <div className="relative" style={{ width: ringSize, height: ringSize }}>
-          <ProgressRing
-            progress={progress}
-            size={ringSize}
-            strokeWidth={4}
-            color="#6366F1"
-            glowColor="#6366F1"
-          />
+          <ProgressRing progress={progress} size={ringSize} strokeWidth={4} color="#6366F1" glowColor="#6366F1" />
           <div className="w-full h-full rounded-full border border-indigo-500/20 flex flex-col items-center justify-center backdrop-blur-md bg-black/40 shadow-[0_0_60px_rgba(99,102,241,0.1)]">
             {completed ? (
               <>
                 <p className="text-3xl mb-3">🙏</p>
                 <p className="text-indigo-300 text-sm font-bold tracking-[0.2em] uppercase">Complete</p>
-                <p className="text-white/30 text-[10px] mt-2">{meditationTime.m}m session done</p>
               </>
             ) : (
               <>
@@ -787,19 +848,12 @@ function MeditationTracker() {
                 <p className={`font-mono font-extralight text-white ${meditationTime.h > 0 ? 'text-5xl' : 'text-6xl'}`}>
                   {formatRemaining(remainingMs)}
                 </p>
-                {isRunning && (
-                  <div className="mt-5 w-12 h-0.5 bg-indigo-500/20 rounded-full overflow-hidden">
-                    <div className="h-full bg-indigo-400/60 rounded-full"
-                      style={{ width: `${progress}%`, transition: 'width 0.5s linear' }} />
-                  </div>
-                )}
               </>
             )}
           </div>
         </div>
       </div>
 
-      {/* Controls */}
       <div className="flex gap-4 w-full mt-4">
         <button onClick={handleReset}
           className="flex-1 py-4 rounded-2xl bg-white/4 border border-white/8 hover:bg-white/8 transition-all flex justify-center items-center active:scale-95">
@@ -807,13 +861,9 @@ function MeditationTracker() {
         </button>
         <button onClick={handleStartPause}
           className={`flex-[2.5] py-4 rounded-2xl transition-all flex justify-center items-center border border-white/12 shadow-lg active:scale-95 ${
-            isRunning
-              ? 'bg-indigo-500/70 hover:bg-indigo-500/90'
-              : 'bg-white/8 hover:bg-white/12'
+            isRunning ? 'bg-indigo-500/70 hover:bg-indigo-500/90' : 'bg-white/8 hover:bg-white/12'
           }`}>
-          {isRunning
-            ? <Pause size={28} className="text-white fill-current" />
-            : <Play size={28} className="text-white fill-current ml-1" />}
+          {isRunning ? <Pause size={28} className="text-white fill-current" /> : <Play size={28} className="text-white fill-current ml-1" />}
         </button>
       </div>
     </div>
@@ -825,7 +875,6 @@ function MeditationTracker() {
 // ============================================================
 export default function App() {
   const [activeTab, setActiveTab] = useState<'run' | 'yoga' | 'meditation'>('run');
-
   const tabs = [
     { id: 'run' as const, icon: Footprints, label: 'Cardio', color: 'text-blue-400' },
     { id: 'yoga' as const, icon: Flower2, label: 'Yoga', color: 'text-emerald-400' },
@@ -834,9 +883,8 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#080808] flex flex-col items-center pt-2 relative overflow-hidden font-sans">
-      {/* Subtle ambient glow */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden">
-        <div className={`absolute -top-32 left-1/2 -translate-x-1/2 w-80 h-80 rounded-full blur-3xl opacity-6 transition-all duration-1000 ${
+        <div className={`absolute -top-32 left-1/2 -translate-x-1/2 w-80 h-80 rounded-full blur-3xl opacity-5 transition-all duration-1000 ${
           activeTab === 'run' ? 'bg-blue-600' : activeTab === 'yoga' ? 'bg-emerald-600' : 'bg-indigo-600'
         }`} />
       </div>
@@ -845,7 +893,6 @@ export default function App() {
       {activeTab === 'yoga' && <YogaTracker />}
       {activeTab === 'meditation' && <MeditationTracker />}
 
-      {/* Bottom Navigation */}
       <div className="fixed bottom-5 w-[85%] max-w-xs bg-white/5 backdrop-blur-2xl border border-white/8 flex justify-between p-1.5 rounded-2xl shadow-[0_20px_40px_rgba(0,0,0,0.6)] z-50">
         {tabs.map(({ id, icon: Icon, label, color }) => (
           <button key={id} onClick={() => setActiveTab(id)}
